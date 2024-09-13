@@ -3,6 +3,7 @@ require "koudoku/errors"
 require "generators/koudoku/install_generator"
 require "generators/koudoku/views_generator"
 require 'stripe_event'
+require './app/helpers/koudoku/application_helper'
 
 module Koudoku
   mattr_accessor :subscriptions_owned_by
