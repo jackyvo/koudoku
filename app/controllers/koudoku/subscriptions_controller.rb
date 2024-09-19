@@ -80,7 +80,6 @@ module Koudoku
     end
 
     def index
-
       # don't bother showing the index if they've already got a subscription.
       if current_owner and current_owner.subscription.present?
         redirect_to koudoku.edit_owner_subscription_path(current_owner, current_owner.subscription)
@@ -92,12 +91,53 @@ module Koudoku
         @subscription = ::Subscription.new({Koudoku.owner_id_sym => @owner.id})
         @subscription.subscription_owner = @owner
       end
+      @plans = Plan.where("display_order != ?", 0).order(:display_order)
+      @coupon = KoudokuCoupons::Promotion.find_by_coupon_code(session[:koudoku_coupon_code])
+      render layout: 'koudoku'
+    end
+    
+    def show
+      render layout: 'tachyons/lite' 
+    end
+    
+    def edit
+      @plans = Plan.where("display_order != ?", 0).order(:display_order)
+      set_setup_session
 
+      render layout: 'tachyons/lite' unless session_id.present?
+    end
+
+    def update
+      if @subscription.update_attributes(subscription_params) && @subscription.errors.blank?
+        flash[:notice] = I18n.t('koudoku.confirmations.subscription_updated')
+        redirect_to owner_subscription_path(@owner, @subscription)
+      else
+        if @subscription.errors[:card].any?
+          params[:update] = 'card'
+          plan = ::Plan.find(@subscription.plan_id)
+          callback_url = koudoku.edit_owner_subscription_url(@owner, @subscription, update: 'update_fail_card')
+          @session = stripe_checkout_service(plan).change_setup_session(
+            callback_url, @subscription
+          )
+          render :edit
+        elsif @subscription.errors[:default_payment_method].any?
+          params[:update] = 'card'
+          plan = ::Plan.find(@subscription.plan_id)
+          callback_url = koudoku.edit_owner_subscription_url(@owner, @subscription, update: 'default_payment_method')
+          @session = stripe_checkout_service(plan).update_setup_session(
+            callback_url, @subscription
+          )
+          render :edit
+
+        else
+          flash[:error] = @subscription.errors[:base].join(',')
+          redirect_to koudoku.edit_owner_subscription_url(@owner, @subscription) and return
+        end
+      end
     end
 
     def new
       if no_owner?
-
         if defined?(Devise)
 
           # by default these methods support devise.
@@ -106,14 +146,18 @@ module Koudoku
           else
             redirect_to_sign_up
           end
-
+          
         else
           raise I18n.t('koudoku.failure.feature_depends_on_devise')
         end
 
       else
-        @subscription = ::Subscription.new
-        @subscription.plan = ::Plan.find(params[:plan])
+        @plans = Plan.where("display_order != ?", 0).order(:display_order)
+        @upgrade = true if (params[:upgrade])
+        @coupon = KoudokuCoupons::Promotion.find_by_coupon_code(session[:koudoku_coupon_code])
+        
+        set_checkout_session
+        render layout: 'koudoku' unless session_id.present?
       end
     end
 
@@ -138,27 +182,11 @@ module Koudoku
       end
     end
 
-    def show
-    end
-
     def cancel
       flash[:notice] = I18n.t('koudoku.confirmations.subscription_cancelled')
       @subscription.plan_id = nil
       @subscription.save
       redirect_to owner_subscription_path(@owner, @subscription)
-    end
-
-    def edit
-    end
-
-    def update
-      if @subscription.update_attributes(subscription_params)
-        flash[:notice] = I18n.t('koudoku.confirmations.subscription_updated')
-        redirect_to owner_subscription_path(@owner, @subscription)
-      else
-        flash[:error] = I18n.t('koudoku.failure.problem_processing_transaction')
-        render :edit
-      end
     end
 
     private
@@ -184,6 +212,75 @@ module Koudoku
       controller.respond_to?(:new_subscription_notice_message) ?
           controller.try(:new_subscription_notice_message) :
           I18n.t('koudoku.confirmations.subscription_upgraded')
+    end
+
+    def set_setup_session
+      if session_id.present?
+        if params[:update] == 'update_fail_card'
+          stripe_checkout_service.upgrade_again_payment(session_id, @subscription)
+        elsif params[:update] == 'default_payment_method'
+          stripe_checkout_service.upgrade_default_payment(session_id, @subscription)
+        else
+          stripe_checkout_service.attach_payment(session_id, @subscription)
+        end
+        flash[:notice] = "Success! Your subscription was updated!"
+        redirect_to owner_subscription_path(@owner, @subscription)
+
+      elsif params[:update] == 'card'
+        callback_url = edit_owner_subscription_url(@owner, @subscription)
+        @session = stripe_checkout_service.init_setup_session(
+          callback_url, @subscription
+        )
+      end
+    end
+    
+    def set_checkout_session
+      if session_id.present?
+        subscription_params = stripe_checkout_service.finalize_payment(
+          session_id
+        )
+
+        create_new_subscription(subscription_params)
+      elsif params[:plan].present?
+        plan = ::Plan.find(params[:plan])
+        callback_url = new_owner_subscription_url(@owner, plan: plan.id)
+
+        @session = stripe_checkout_service(plan).init_session(
+          callback_url, session[:koudoku_coupon_code]
+        )
+      end
+    end
+
+    def create_new_subscription(subscription_params)
+      @subscription = ::Subscription.new(subscription_params)
+      @subscription.subscription_owner = @owner
+      @subscription.coupon_code = session[:koudoku_coupon_code]
+      
+      if @subscription.save
+        flash[:analytics] = "subscription_created"
+        redirect_to(main_app.user_path(@owner, :subscription_created => true), :notice => "Thank you! Your Clippings.me Premium account is live.") and return
+      else
+        flash[:error] = "There was a problem processing your card. Please try another card, or contact info@clippings.me for assistance."
+        redirect_to koudoku.owner_subscriptions_path(current_user) and return
+      end
+    end
+
+    def stripe_checkout_service(plan=nil)
+      StripeCheckoutService.new(plan, @owner)
+    end
+
+    def session_id
+      params[:session_id]
+    end
+
+    def show_existing_subscription
+      if @owner.subscription.present?
+        if @owner.subscription.plan.nil?
+          redirect_to edit_owner_subscription_path(@owner, @owner.subscription)
+        else
+          redirect_to owner_subscription_path(@owner, @owner.subscription)
+        end
+      end
     end
   end
 end
